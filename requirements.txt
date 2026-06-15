@@ -5,3 +5,4 @@ google-genai
 openpyxl
 pypdf
 python-docx
+reportlab
