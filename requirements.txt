@@ -3,3 +3,5 @@ pandas
 pydantic
 google-genai
 openpyxl
+pypdf
+python-docx
