@@ -3,6 +3,8 @@ import re
 import json
 import io
 import time
+import base64
+import html as ihtml
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -105,6 +107,161 @@ def match_assets(term, kind, inventory, limit=10):
             results.append((score, e))
     results.sort(key=lambda x: (-x[0], x[1]["name"].lower()))
     return [e for _, e in results[:limit]]
+
+
+# ----------------------------------------------------
+# RECOMMENDATION RENDERING (uniform CSS grid)
+# ----------------------------------------------------
+CARD_CSS = """
+<style>
+.ccm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  gap:12px;margin:6px 0 22px;}
+.ccm-card{border:1px solid #e6e6e6;border-radius:8px;overflow:hidden;background:#fff;}
+.ccm-imgbox{height:140px;display:flex;align-items:center;justify-content:center;
+  background:#f4f4f4;}
+.ccm-imgbox img{max-width:100%;max-height:100%;object-fit:contain;}
+.ccm-noimg{color:#aaa;font-size:12px;}
+.ccm-cap{padding:6px 8px;font-size:12px;line-height:1.35;}
+.ccm-cap b{display:block;word-break:break-word;}
+.ccm-cap span{color:#777;}
+</style>
+"""
+
+
+@st.cache_data(show_spinner=False)
+def _img_data_uri(path_str):
+    p = Path(path_str)
+    if not p.exists():
+        return ""
+    return "data:image/jpeg;base64," + base64.b64encode(p.read_bytes()).decode()
+
+
+def render_grid(matches):
+    cards = []
+    for m in matches:
+        uri = _img_data_uri(str(THUMBS_DIR / m["image"])) if m["image"] else ""
+        img = f'<img src="{uri}"/>' if uri else '<div class="ccm-noimg">no image</div>'
+        yrs = ", ".join(sorted(m["years"]))
+        cards.append(
+            f'<div class="ccm-card"><div class="ccm-imgbox">{img}</div>'
+            f'<div class="ccm-cap"><b>{ihtml.escape(m["name"])}</b>'
+            f'<span>{ihtml.escape(m["type"])} &middot; {ihtml.escape(yrs)}</span></div></div>')
+    st.markdown(f'<div class="ccm-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def compute_recs(data, inventory):
+    """-> (recs, sourcing_rows). recs = [(title, kind, [(element, matches)])]"""
+    groups = [("Characters", "character", data.get("character_summaries", [])),
+              ("Environments", "environment", data.get("environment_summaries", [])),
+              ("Props", "prop", data.get("prop_summaries", []))]
+    recs, sourcing = [], []
+    for title, kind, items in groups:
+        entries = []
+        for it in items:
+            elem = it["name"]
+            matches = match_assets(elem, kind, inventory) if inventory else []
+            entries.append((elem, matches))
+            if matches:
+                sourcing.append([elem, title.rstrip("s"), "HAVE (internal)",
+                                 ", ".join(m["name"] for m in matches[:5])])
+            else:
+                sourcing.append([elem, title.rstrip("s"), "REQUEST (vendor)", ""])
+        recs.append((title, kind, entries))
+    return recs, sourcing
+
+
+# ----------------------------------------------------
+# PDF EXPORT (breakdown + shotlist + recommendations w/ images)
+# ----------------------------------------------------
+def generate_pdf(shot_df, data, recs):
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                     Table, TableStyle, Image as RLImage)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                            leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
+    ss = getSampleStyleSheet()
+    h1, h2, h3, body = ss["Title"], ss["Heading2"], ss["Heading3"], ss["BodyText"]
+    small = ParagraphStyle("s", parent=body, fontSize=8, leading=10)
+    cap = ParagraphStyle("c", parent=body, fontSize=7, leading=8, alignment=1)
+    story = [Paragraph("CCM Script Breakdown", h1), Spacer(1, 6)]
+
+    # --- Shotlist ---
+    story.append(Paragraph("Shotlist", h2))
+    if shot_df is not None and not shot_df.empty:
+        head = list(shot_df.columns)
+        tdata = [[Paragraph(f"<b>{ihtml.escape(str(c))}</b>", small) for c in head]]
+        for _, row in shot_df.iterrows():
+            tdata.append([Paragraph(ihtml.escape(str(row[c])), small) for c in head])
+        t = Table(tdata, colWidths=[40, 40, 58, 70, 322, 235], repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F3864")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f7fb")]),
+        ]))
+        story.append(t)
+    else:
+        story.append(Paragraph("No shots.", small))
+    story.append(Spacer(1, 14))
+
+    # --- Breakdown ---
+    story.append(Paragraph("Breakdown", h2))
+    for label, key in [("Characters", "character_summaries"),
+                       ("Environments", "environment_summaries"),
+                       ("Props", "prop_summaries")]:
+        items = data.get(key, [])
+        if not items:
+            continue
+        story.append(Paragraph(label, h3))
+        for it in items:
+            story.append(Paragraph(
+                f"<b>{ihtml.escape(it['name'])}</b> &mdash; {ihtml.escape(it.get('summary',''))}", small))
+        story.append(Spacer(1, 6))
+    story.append(Spacer(1, 8))
+
+    # --- Recommendations ---
+    story.append(Paragraph("Internal Asset Recommendations", h2))
+    for title, kind, entries in recs:
+        if not entries:
+            continue
+        story.append(Paragraph(title, h3))
+        for elem, matches in entries:
+            if not matches:
+                story.append(Paragraph(f"<b>{ihtml.escape(elem)}</b> &mdash; request from vendor", small))
+                continue
+            story.append(Paragraph(f"<b>{ihtml.escape(elem)}</b> &mdash; {len(matches)} internal option(s)", small))
+            cells = []
+            for m in matches:
+                p = THUMBS_DIR / m["image"] if m["image"] else None
+                if p and p.exists():
+                    iw, ih = ImageReader(str(p)).getSize()
+                    sc = min(150.0 / iw, 110.0 / ih)
+                    flow = RLImage(str(p), width=iw * sc, height=ih * sc)
+                else:
+                    flow = Paragraph("no image", cap)
+                yrs = ", ".join(sorted(m["years"]))
+                cells.append(Table([[flow], [Paragraph(
+                    f"{ihtml.escape(m['name'])}<br/>{ihtml.escape(m['type'])} &middot; {ihtml.escape(yrs)}", cap)]],
+                    colWidths=[185]))
+            rows = [cells[i:i + 4] for i in range(0, len(cells), 4)]
+            for r in rows:
+                while len(r) < 4:
+                    r.append("")
+            grid = Table(rows, colWidths=[190] * 4)
+            grid.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                      ("BOTTOMPADDING", (0, 0), (-1, -1), 10)]))
+            story.append(grid)
+        story.append(Spacer(1, 6))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ----------------------------------------------------
@@ -338,10 +495,11 @@ elif st.session_state.step == "final":
     st.header("🚀 Production Breakdown & Shotlist")
     data = st.session_state.final_output
     inventory = load_inventory()
+    recs, sourcing_rows = compute_recs(data, inventory)
 
     # ---------- EDITABLE SHOTLIST ----------
     st.subheader("🎥 Shotlist (editable)")
-    st.caption("Edit any cell, add or delete rows — the Excel export and table below update automatically.")
+    st.caption("Edit any cell, add or delete rows — the exports below update automatically.")
     shot_list = data.get("shotlist", [])
     if shot_list:
         df = pd.DataFrame(shot_list)
@@ -350,64 +508,32 @@ elif st.session_state.step == "final":
         df.columns = SHOT_COLS
     else:
         df = pd.DataFrame(columns=SHOT_COLS)
-
     edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True,
                                key="shot_editor")
 
-    # ---------- INTERNAL ASSET RECOMMENDATIONS ----------
+    # ---------- DOWNLOADS ----------
     st.markdown("---")
-    st.subheader("🗂️ Internal Asset Recommendations")
-    if inventory is None:
-        st.warning("Asset library not found. Make sure the **app_data** folder "
-                   "(inventory.csv + thumbs) is committed alongside the app.")
-        sourcing_rows = []
-    else:
-        st.caption(f"Matched against {len(inventory)} internal CCM assets · "
-                   f"[source inventory]({INVENTORY_SHEET_URL})")
-        groups = [("Characters", "character", data.get("character_summaries", [])),
-                  ("Environments", "environment", data.get("environment_summaries", [])),
-                  ("Props", "prop", data.get("prop_summaries", []))]
-        sourcing_rows = []
-        for title, kind, items in groups:
-            if not items:
-                continue
-            st.markdown(f"### {title}")
-            for it in items:
-                elem = it["name"]
-                matches = match_assets(elem, kind, inventory)
-                if matches:
-                    st.markdown(f"**{elem}**  —  ✅ {len(matches)} internal option(s)")
-                    cols = st.columns(5)
-                    for i, m in enumerate(matches):
-                        with cols[i % 5]:
-                            img_path = THUMBS_DIR / m["image"] if m["image"] else None
-                            if img_path and img_path.exists():
-                                st.image(str(img_path), use_container_width=True)
-                            else:
-                                st.markdown("`no image`")
-                            yrs = ", ".join(sorted(m["years"]))
-                            st.caption(f"{m['name']}\n\n{m['type']} · {yrs}")
-                    sourcing_rows.append([elem, title.rstrip("s"), "HAVE (internal)",
-                                          ", ".join(m["name"] for m in matches[:5])])
-                else:
-                    st.markdown(f"**{elem}**  —  ⚠️ not in library · **request from vendor**")
-                    sourcing_rows.append([elem, title.rstrip("s"), "REQUEST (vendor)", ""])
-                st.markdown("")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "📥 Download Excel (.xlsx)",
+            data=generate_excel(edited_df, data, sourcing_rows),
+            file_name="production_breakdown.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+    with c2:
+        try:
+            pdf_bytes = generate_pdf(edited_df, data, recs)
+            st.download_button("📄 Download PDF (breakdown + shotlist + recs)",
+                               data=pdf_bytes, file_name="production_breakdown.pdf",
+                               mime="application/pdf", use_container_width=True)
+        except Exception as e:
+            st.button("📄 PDF unavailable", disabled=True, use_container_width=True)
+            st.caption(f"Add `reportlab` to requirements.txt to enable PDF export. ({e})")
 
-        have = sum(1 for r in sourcing_rows if r[2].startswith("HAVE"))
-        need = len(sourcing_rows) - have
-        st.info(f"**{have}** elements have internal options · **{need}** to request from the vendor")
-
-    # ---------- EXPORT (built from edited shotlist) ----------
+    # ---------- BREAKDOWN (above recommendations) ----------
     st.markdown("---")
-    excel_file = generate_excel(edited_df, data, sourcing_rows)
-    st.download_button("📥 Download Production Board (Excel .xlsx)", data=excel_file,
-                       file_name="production_breakdown.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True)
-
-    # ---------- SUMMARY TABS ----------
-    st.markdown("---")
+    st.subheader("📋 Breakdown")
     t1, t2, t3 = st.tabs(["👥 Characters", "📍 Locations", "🎒 Key Props"])
     with t1:
         for c in data.get("character_summaries", []):
@@ -419,6 +545,31 @@ elif st.session_state.step == "final":
         for p in data.get("prop_summaries", []):
             st.markdown(f"**🎒 {p['name']}**"); st.write(p["summary"]); st.markdown("---")
 
+    # ---------- INTERNAL ASSET RECOMMENDATIONS ----------
+    st.markdown("---")
+    st.subheader("🗂️ Internal Asset Recommendations")
+    if inventory is None:
+        st.warning("Asset library not found. Make sure the **app_data** folder "
+                   "(inventory.csv + thumbs) is committed alongside the app.")
+    else:
+        st.markdown(CARD_CSS, unsafe_allow_html=True)
+        st.caption(f"Matched against {len(inventory)} internal CCM assets · "
+                   f"[source inventory]({INVENTORY_SHEET_URL})")
+        for title, kind, entries in recs:
+            if not entries:
+                continue
+            st.markdown(f"### {title}")
+            for elem, matches in entries:
+                if matches:
+                    st.markdown(f"**{ihtml.escape(elem)}** — ✅ {len(matches)} internal option(s)")
+                    render_grid(matches)
+                else:
+                    st.markdown(f"**{ihtml.escape(elem)}** — ⚠️ not in library · **request from vendor**")
+        have = sum(1 for r in sourcing_rows if r[2].startswith("HAVE"))
+        need = len(sourcing_rows) - have
+        st.info(f"**{have}** elements have internal options · **{need}** to request from the vendor")
+
+    st.markdown("---")
     if st.button("🔄 Analyze New Script"):
         st.session_state.step = "input"
         st.session_state.raw_extraction = None
